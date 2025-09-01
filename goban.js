@@ -43,8 +43,9 @@ class vGoban {
         this.myPlayerNumber = this.playerType === 'host' ? 1 : this.playerType === 'guest' ? 2 : 0; // 0 = spectator
         this.connectedUsers = new Map();
         
-        // Ko rule tracking - store last 2 board states
-        this.boardStateHistory = [];
+                 // Ko rule tracking - store last 2 board states
+         this.boardStateHistory = [];
+         this.lastMoveWasKoCapture = false;
         
         // Initialize card system if enabled
         if (this.cardMode) {
@@ -241,18 +242,23 @@ class vGoban {
         this.board[move.x][move.y] = move.color;
         this.moves.push(move);
         
-        // Check for captures
-        const captures = this.checkCaptures(move);
-        if (captures.length > 0) {
-            this.triggerCallback('capture', { move, captures });
-        }
-        
-        // Store board state AFTER making the move and captures (for Ko rule)
-        const currentState = this.getBoardStateString();
-        this.boardStateHistory.push(currentState);
-        if (this.boardStateHistory.length > 2) {
-            this.boardStateHistory.shift(); // Keep only last 2 states
-        }
+                 // Check for captures
+         const captures = this.checkCaptures(move);
+         const hadCaptures = captures.length > 0;
+         if (hadCaptures) {
+             this.triggerCallback('capture', { move, captures });
+         }
+         
+         // Store board state AFTER making the move and captures (for Ko rule)
+         const currentState = this.getBoardStateString();
+         this.boardStateHistory.push(currentState);
+         if (this.boardStateHistory.length > 2) {
+             this.boardStateHistory.shift(); // Keep only last 2 states
+         }
+         
+         // Track if this move was a Ko-creating capture
+         // A Ko-creating capture is one that captures exactly one stone and creates a symmetric position
+         this.lastMoveWasKoCapture = hadCaptures && captures.length === 1;
 
         
         // Switch current player after successful move
@@ -1355,6 +1361,11 @@ class vGoban {
         // Switch players (this counts as a pass)
         this.currentPlayer = this.currentPlayer === 1 ? 2 : 1;
         
+        // Send updated game state to other players in multiplayer
+        if (this.multiplayer && this.socket) {
+            this.sendGameState();
+        }
+        
         console.log(`Player discarded ${discardedCard.name} to graveyard and drew ${newCard ? newCard.name : 'no card'}`);
         
         return { success: true, discarded: discardedCard, drawn: newCard };
@@ -1384,15 +1395,16 @@ class vGoban {
     sendGameState() {
         if (!this.socket) return;
         
-        const gameState = {
-            board: this.board,
-            currentPlayer: this.currentPlayer,
-            moves: this.moves,
-            boardStateHistory: this.boardStateHistory,
-            graveyard: this.graveyard,
-            // Only send visible hands (not opponent's hand)
-            hands: this.getVisibleHands()
-        };
+                 const gameState = {
+             board: this.board,
+             currentPlayer: this.currentPlayer,
+             moves: this.moves,
+             boardStateHistory: this.boardStateHistory,
+             lastMoveWasKoCapture: this.lastMoveWasKoCapture,
+             graveyard: this.graveyard,
+             // Only send visible hands (not opponent's hand)
+             hands: this.getVisibleHands()
+         };
         
         this.socket.emit("game-state", gameState);
     }
@@ -1415,11 +1427,12 @@ class vGoban {
     syncGameState(state) {
         console.log('Syncing game state:', state);
         
-        this.board = state.board;
-        this.currentPlayer = state.currentPlayer;
-        this.moves = state.moves;
-        this.boardStateHistory = state.boardStateHistory;
-        this.graveyard = state.graveyard;
+                 this.board = state.board;
+         this.currentPlayer = state.currentPlayer;
+         this.moves = state.moves;
+         this.boardStateHistory = state.boardStateHistory;
+         this.lastMoveWasKoCapture = state.lastMoveWasKoCapture || false;
+         this.graveyard = state.graveyard;
         
         // Reconstruct hands with proper Card objects (only update hands that are visible to this player)
         if (state.hands) {
@@ -1571,26 +1584,39 @@ vGoban.rules = {
         return liberties.length > 0;
     },
     
-    // Ko rule - prevent immediate board state repetition
-    koRule: function(move) {
-        if (this.boardStateHistory.length === 0) return true;
-        
-        // Temporarily make the move
-        const originalBoard = this.copyBoard();
-        this.board[move.x][move.y] = move.color;
-        
-        // Apply captures to see the resulting board state
-        const captures = this.checkCaptures(move, false);
-        captures.forEach(({x, y}) => this.board[x][y] = 0);
-        
-        const newState = this.getBoardStateString();
-        this.board = originalBoard;
-        
-        // Ko rule: does this move recreate any previous board state?
-        const wouldRepeat = this.boardStateHistory.includes(newState);
-        
-        return !wouldRepeat;
-    },
+         // Ko rule - prevent immediate board state repetition
+     koRule: function(move) {
+         // Ko rule only applies if the LAST move was a Ko-creating capture
+         // (captured exactly one stone, creating a symmetric Ko position)
+         if (!this.lastMoveWasKoCapture) {
+             return true; // If last move wasn't a Ko-creating capture, Ko rule doesn't apply
+         }
+         
+         if (this.boardStateHistory.length === 0) return true;
+         
+         // Temporarily make the move
+         const originalBoard = this.copyBoard();
+         this.board[move.x][move.y] = move.color;
+         
+         // Apply captures to see the resulting board state
+         const captures = this.checkCaptures(move, false);
+         
+         // Ko rule only applies if THIS move would also be a capture
+         if (captures.length === 0) {
+             this.board = originalBoard;
+             return true; // No capture = no Ko violation possible
+         }
+         
+         captures.forEach(({x, y}) => this.board[x][y] = 0);
+         
+         const newState = this.getBoardStateString();
+         this.board = originalBoard;
+         
+         // Ko rule: does this capturing move recreate any previous board state?
+         const wouldRepeat = this.boardStateHistory.includes(newState);
+         
+         return !wouldRepeat; // Return true if valid (doesn't repeat)
+     },
     
     // Alternating turns
     alternateTurns: function(move) {
@@ -1842,111 +1868,3 @@ class Card {
         return canComplete;
     }
 }
-
-const cards = [
-    new Card([
-        "00000",
-        "01000",
-        "00010",
-        "00000",
-        "00000",
-    ], "knight"),
-    new Card([
-        "00000",
-        "00010",
-        "00100",
-        "00000",
-        "00000",
-    ], "diagonal"),
-    new Card([
-        "00000",
-        "01010",
-        "00000",
-        "00100",
-        "00000",
-    ], "dog"),
-    new Card([
-        "00000",
-        "01010",
-        "00000",
-        "00000",
-        "00100",
-    ], "horse"),
-    new Card([
-        "00000",
-        "01000",
-        "00000",
-        "00000",
-        "00100",
-    ], "large knight"),
-    new Card([
-        "00000",
-        "00110",
-        "00000",
-        "00100",
-        "00000",
-    ], "Half Table"),
-    new Card([
-        "00010",
-        "00100",
-        "00000",
-        "00100",
-        "00000",
-    ], "Dia Jump"),
-    new Card([
-        "00000",
-        "00100",
-        "00000",
-        "00100",
-        "00000",
-    ], "Jump"),
-        new Card([
-        "00000",
-        "00010",
-        "00000",
-        "01000",
-        "00000",
-    ], "Elephant"),
-    new Card([
-        "00100",
-        "00010",
-        "00000",
-        "00100",
-        "00000",
-    ], "Panther"),
-    new Card([
-        "00000",
-        "00100",
-        "00010",
-        "00100",
-        "00000",
-    ], "Tiger"),
-    new Card([
-        "00000",
-        "00000",
-        "00110",
-        "00100",
-        "00000",
-    ], "Triangle"),
-    new Card([
-        "00000",
-        "00000",
-        "00100",
-        "00100",
-        "00000",
-    ], "Pillar"),
-    new Card([
-        "00100",
-        "00000",
-        "00000",
-        "00100",
-        "00000",
-    ], "two space"),
-    new Card([
-        "00000",
-        "01000",
-        "00010",
-        "00000",
-        "00100",
-    ], "bend")
-]
